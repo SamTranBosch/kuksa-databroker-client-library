@@ -1,0 +1,42 @@
+{
+  "broker": {
+    "serverURI": "127.0.0.1:55555"
+  },
+  "signal": [
+    {
+      "path": "Vehicle.Cabin.Seat.Row1.DriverSide.Position",
+      "value": 3
+    },
+    {
+      "path": "Vehicle.Body.Lights.Beam.Low.IsOn",
+      "value": true
+    },
+    {
+      "path": "Vehicle.Body.Lights.Hazard.IsSignaling",
+      "value": true
+    },
+    {
+      "path": "Vehicle.Body.Lights.Brake.IsActive",
+      "value": true
+    },
+    {
+      "path": "Vehicle.Cabin.HVAC.Station.Row1.Driver.FanSpeed",
+      "value": 86
+    },
+    {
+      "path": "Vehicle.Cabin.HVAC.Station.Row1.Passenger.FanSpeed",
+      "value": 87
+    }
+  ],
+  "actuator": [
+    {
+      "path": "Vehicle.Cabin.HVAC.Station.Row1.Driver.FanSpeed",
+      "value": 86
+    },
+    {
+      "path": "Vehicle.Cabin.HVAC.Station.Row1.Passenger.FanSpeed",
+      "value": 87
+    }
+  ],
+  "debug": true
+}
