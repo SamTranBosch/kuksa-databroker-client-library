@@ -6,6 +6,12 @@
 #include "kuksa/val/v1/types.pb.h"
 
 #include <sstream>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <set>
 
 // nlohmann/json (header-only)
 #include <nlohmann/json.hpp>
@@ -107,6 +113,23 @@ KuksaClient::KuksaClient(const Config &config)
       signalPaths_(config.signalPaths),
       config_(config),
       pImpl(std::make_unique<Impl>()) {
+  // Start the reconnection thread
+  reconnectThread_ = std::thread([this]() {
+    while (!shouldStop_.load()) {
+      std::unique_lock<std::mutex> lock(reconnectMutex_);
+      reconnectCV_.wait_for(lock, std::chrono::seconds(5), [this]() {
+        return shouldStop_.load() || (!connected_.load() && autoReconnect_.load());
+      });
+
+      if (shouldStop_.load()) break;
+
+      if (!connected_.load() && autoReconnect_.load()) {
+        if (attemptReconnection()) {
+          restartSubscriptions();
+        }
+      }
+    }
+  });
 }
 
 KuksaClient::KuksaClient(const std::string &configFile) : pImpl(std::make_unique<Impl>()) {
@@ -116,10 +139,59 @@ KuksaClient::KuksaClient(const std::string &configFile) : pImpl(std::make_unique
   serverURI_   = config_.serverURI;
   debug_       = config_.debug;
   signalPaths_ = config_.signalPaths;
+
+  // Start the reconnection thread
+  reconnectThread_ = std::thread([this]() {
+    while (!shouldStop_.load()) {
+      std::unique_lock<std::mutex> lock(reconnectMutex_);
+      reconnectCV_.wait_for(lock, std::chrono::seconds(5), [this]() {
+        return shouldStop_.load() || (!connected_.load() && autoReconnect_.load());
+      });
+
+      if (shouldStop_.load()) break;
+
+      if (!connected_.load() && autoReconnect_.load()) {
+        if (attemptReconnection()) {
+          restartSubscriptions();
+        }
+      }
+    }
+  });
 }
 
 KuksaClient::~KuksaClient() {
-  joinAllSubscriptions();
+  // Signal all threads to stop
+  shouldStop_.store(true);
+
+  // Mark as disconnected to prevent new operations
+  connected_.store(false);
+
+  // Wake up reconnection thread
+  reconnectCV_.notify_all();
+
+  // Join reconnection thread first
+  try {
+    if (reconnectThread_.joinable()) {
+      reconnectThread_.join();
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Exception while joining reconnection thread: " << e.what() << std::endl;
+  }
+
+  // Join all subscription threads
+  try {
+    joinAllSubscriptions();
+  } catch (const std::exception& e) {
+    std::cerr << "Exception while joining subscription threads: " << e.what() << std::endl;
+  }
+
+  // Clear subscription tracking
+  {
+    std::lock_guard<std::mutex> lock1(subscriptionsMutex_);
+    std::lock_guard<std::mutex> lock2(subscriptionPathsMutex_);
+    activeSubscriptions_.clear();
+    activeSubscriptionPaths_.clear();
+  }
 }
 
 //=============================================================================
@@ -127,9 +199,43 @@ KuksaClient::~KuksaClient() {
 //=============================================================================
 
 void KuksaClient::connect() {
-  pImpl->channel = grpc::CreateChannel(serverURI_, grpc::InsecureChannelCredentials());
-  pImpl->stub = kuksa::val::v1::VAL::NewStub(pImpl->channel);
-  std::cout << "Connected to " << serverURI_ << std::endl;
+  try {
+    std::cout << "Connecting to " << serverURI_ << "..." << std::endl;
+    pImpl->channel = grpc::CreateChannel(serverURI_, grpc::InsecureChannelCredentials());
+    pImpl->stub = kuksa::val::v1::VAL::NewStub(pImpl->channel);
+
+    // Test the connection with a simple call
+    kuksa::val::v1::GetServerInfoRequest request;
+    kuksa::val::v1::GetServerInfoResponse response;
+    grpc::ClientContext context;
+    grpc::Status status = pImpl->stub->GetServerInfo(&context, request, &response);
+
+    if (!status.ok()) {
+      throw std::runtime_error("Connection test failed: " + status.error_message());
+    }
+
+    connected_.store(true);
+    std::cout << "Successfully connected to " << serverURI_ << std::endl;
+  } catch (const std::exception& e) {
+    connected_.store(false);
+    std::cerr << "Failed to connect to " << serverURI_ << ": " << e.what() << std::endl;
+    throw;
+  }
+}
+
+bool KuksaClient::isConnected() const {
+  return connected_.load();
+}
+
+void KuksaClient::setAutoReconnect(bool enabled) {
+  autoReconnect_.store(enabled);
+  if (enabled && !connected_.load()) {
+    reconnectCV_.notify_one();
+  }
+}
+
+bool KuksaClient::reconnect() {
+  return attemptReconnection();
 }
 
 std::string KuksaClient::getCurrentValue(const std::string &entryPath) {
@@ -142,8 +248,8 @@ std::string KuksaClient::getTargetValue(const std::string &entryPath) {
 
 std::string KuksaClient::getValue(const std::string &entryPath, GetView view, bool target) {
   std::string valueStr = "";
-  if (!pImpl->stub) {
-      std::cerr << "Client not connected. Aborting " << std::endl;
+  if (!pImpl->stub || !connected_.load()) {
+      std::cerr << "Client not connected. Aborting getValue()" << std::endl;
       return valueStr;
   }
   kuksa::val::v1::GetRequest request;
@@ -161,6 +267,12 @@ std::string KuksaClient::getValue(const std::string &entryPath, GetView view, bo
   grpc::Status status = pImpl->stub->Get(&context, request, &response);
   if (!status.ok()) {
       std::cerr << " Get() RPC failed: " << status.error_message() << std::endl;
+      // Check if this is a connection failure
+      if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
+          status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
+          status.error_message().find("Socket closed") != std::string::npos) {
+        handleConnectionFailure();
+      }
       return valueStr;
   }
   if (response.error().code() != 0) {
@@ -190,7 +302,7 @@ std::string KuksaClient::getValue(const std::string &entryPath, GetView view, bo
 }
 
 void KuksaClient::streamUpdate(const std::string &entryPath, float newValue) {
-  if (!pImpl->stub) {
+  if (!pImpl->stub || !connected_.load()) {
     std::cerr << "Client not connected. Aborting streamUpdate()." << std::endl;
     return;
   }
@@ -221,6 +333,12 @@ void KuksaClient::streamUpdate(const std::string &entryPath, float newValue) {
   grpc::Status status = stream->Finish();
   if (!status.ok()) {
     std::cerr << "streamUpdate RPC failed: " << status.error_message() << std::endl;
+    // Check if this is a connection failure
+    if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
+        status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
+        status.error_message().find("Socket closed") != std::string::npos) {
+      handleConnectionFailure();
+    }
   } else {
     std::cout << "streamUpdate: Completed successfully." << std::endl;
   }
@@ -238,7 +356,7 @@ void KuksaClient::subscribeCurrentValue(const std::string &entryPath,
 
 void KuksaClient::subscribe(const std::string &entryPath,
     std::function<void(const std::string &, const std::string &, const int &)> userCallback, int field) {
-  if (!pImpl->stub) {
+  if (!pImpl->stub || !connected_.load()) {
     std::cerr << "Client not connected. Aborting subscribe()." << std::endl;
     return;
   }
@@ -282,30 +400,161 @@ void KuksaClient::subscribe(const std::string &entryPath,
   grpc::Status status = reader->Finish();
   if (!status.ok()) {
     std::cerr << "subscribe RPC failed: " << status.error_message() << std::endl;
+    // Check if this is a connection failure
+    if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
+        status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
+        status.error_message().find("Socket closed") != std::string::npos) {
+      handleConnectionFailure();
+    }
   } else {
     std::cout << "Subscription: Stream finished for \"" << entryPath << "\"." << std::endl;
   }
 }
 
-void KuksaClient::subscribeAll(std::function<void(const std::string &, const std::string &, const int &)> userCallback) {
-  for (const auto &path : signalPaths_) {
-    subscriptionThreads_.emplace_back([this, path, userCallback]() {
-      subscribeTargetValue(path, userCallback);
-    });
+void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
+                                         std::function<void(const std::string &, const std::string &, const int &)> userCallback,
+                                         int field) {
+  // Create unique key for this subscription (path + field type)
+  std::string subscriptionKey = entryPath + "_" + std::to_string(field);
+
+  // Check for duplicate subscriptions
+  {
+    std::lock_guard<std::mutex> lock(subscriptionPathsMutex_);
+    if (activeSubscriptionPaths_.count(subscriptionKey) > 0) {
+      std::cout << "Subscription already exists for " << subscriptionKey << ", skipping duplicate" << std::endl;
+      return;
+    }
+    activeSubscriptionPaths_.insert(subscriptionKey);
   }
+
+  // Store subscription info for restart after reconnection
+  {
+    std::lock_guard<std::mutex> lock(subscriptionsMutex_);
+    activeSubscriptions_.push_back({entryPath, userCallback, field});
+  }
+
+  // Start subscription in a loop that handles reconnection
+  subscriptionThreads_.emplace_back([this, entryPath, userCallback, field, subscriptionKey]() {
+    std::cout << "Starting subscription thread for " << subscriptionKey << std::endl;
+
+    // Create a unique ClientContext for this subscription thread
+    std::unique_ptr<grpc::ClientContext> context;
+    std::unique_ptr<grpc::ClientReader<kuksa::val::v1::SubscribeResponse>> reader;
+
+    while (!shouldStop_.load()) {
+      if (connected_.load()) {
+        try {
+          std::cout << "Attempting to subscribe to " << entryPath << std::endl;
+
+          // Create fresh gRPC resources for this attempt
+          context = std::make_unique<grpc::ClientContext>();
+
+          // Prepare subscription request
+          kuksa::val::v1::SubscribeRequest request;
+          auto* subEntry = request.add_entries();
+          subEntry->set_path(entryPath);
+          subEntry->set_view(kuksa::val::v1::VIEW_ALL);
+
+          if (field == FT_ACTUATOR_TARGET) {
+            subEntry->add_fields(kuksa::val::v1::FIELD_ACTUATOR_TARGET);
+          } else {
+            subEntry->add_fields(kuksa::val::v1::FIELD_VALUE);
+          }
+
+          // Start subscription with dedicated context
+          if (pImpl->stub) {
+            reader = pImpl->stub->Subscribe(context.get(), request);
+
+            kuksa::val::v1::SubscribeResponse response;
+            int updateCount = 0;
+
+            while (reader->Read(&response) && !shouldStop_.load()) {
+              ++updateCount;
+              std::cout << "Subscription: Received update #" << updateCount << " for \"" << entryPath << "\"" << std::endl;
+
+              for (int i = 0; i < response.updates_size(); ++i) {
+                const auto &upd = response.updates(i);
+                std::string updatePath = upd.entry().path();
+                std::string updateValue;
+
+                if (field == FT_ACTUATOR_TARGET) {
+                  updateValue = getTargetValue(entryPath);
+                } else {
+                  updateValue = getCurrentValue(entryPath);
+                }
+
+                if (userCallback) {
+                  userCallback(updatePath, updateValue, field);
+                }
+              }
+            }
+
+            // Check status after read loop ends
+            grpc::Status status = reader->Finish();
+            if (!status.ok() && !shouldStop_.load()) {
+              std::cerr << "Subscription RPC failed for " << entryPath << ": " << status.error_message() << std::endl;
+              if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
+                  status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
+                  status.error_message().find("Socket closed") != std::string::npos) {
+                handleConnectionFailure();
+              }
+            }
+          }
+
+          std::cout << "Subscription ended for " << entryPath << std::endl;
+        } catch (const std::exception& e) {
+          std::cerr << "Subscription error for " << entryPath << ": " << e.what() << std::endl;
+          handleConnectionFailure();
+        }
+
+        // Clean up resources
+        reader.reset();
+        context.reset();
+      }
+
+      // Wait before retrying if connection is down
+      if (!connected_.load() && !shouldStop_.load()) {
+        std::cout << "Waiting to retry subscription for " << entryPath << "..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+      }
+    }
+
+    // Remove from active subscriptions when thread exits
+    {
+      std::lock_guard<std::mutex> lock(subscriptionPathsMutex_);
+      activeSubscriptionPaths_.erase(subscriptionKey);
+    }
+
+    std::cout << "Subscription thread ending for " << subscriptionKey << std::endl;
+  });
+}
+
+void KuksaClient::subscribeAll(std::function<void(const std::string &, const std::string &, const int &)> userCallback) {
+  // Subscribe to both TARGET and VALUE for each path, but only create one subscription per unique combination
   for (const auto &path : signalPaths_) {
-    subscriptionThreads_.emplace_back([this, path, userCallback]() {
-      subscribeCurrentValue(path, userCallback);
-    });
+    // Subscribe to target values
+    subscribeWithReconnect(path, userCallback, FT_ACTUATOR_TARGET);
+
+    // Subscribe to current values
+    subscribeWithReconnect(path, userCallback, FT_VALUE);
   }
 }
 
 void KuksaClient::joinAllSubscriptions() {
+  std::cout << "Joining " << subscriptionThreads_.size() << " subscription threads..." << std::endl;
+
   for (auto &t : subscriptionThreads_) {
-    if (t.joinable())
-      t.join();
+    try {
+      if (t.joinable()) {
+        t.join();
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "Exception while joining subscription thread: " << e.what() << std::endl;
+    }
   }
+
   subscriptionThreads_.clear();
+  std::cout << "All subscription threads joined successfully" << std::endl;
 }
 
 void KuksaClient::detachAllSubscriptions() {
@@ -317,7 +566,7 @@ void KuksaClient::detachAllSubscriptions() {
 }
 
 void KuksaClient::getServerInfo() {
-  if (!pImpl->stub) {
+  if (!pImpl->stub || !connected_.load()) {
     std::cerr << "Client not connected. Aborting getServerInfo()." << std::endl;
     return;
   }
@@ -327,6 +576,12 @@ void KuksaClient::getServerInfo() {
   grpc::Status status = pImpl->stub->GetServerInfo(&context, request, &response);
   if (!status.ok()) {
     std::cerr << "getServerInfo RPC failed: " << status.error_message() << std::endl;
+    // Check if this is a connection failure
+    if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
+        status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
+        status.error_message().find("Socket closed") != std::string::npos) {
+      handleConnectionFailure();
+    }
     return;
   }
   std::cout << "Server Info:" << std::endl;
@@ -367,6 +622,11 @@ bool KuksaClient::parseConfig(const std::string &filename, Config &config) {
 //=============================================================================
 template <typename T>
 void KuksaClient::setValueInternalImpl(const std::string &entryPath, const T &newValue, int field) {
+  if (!pImpl->stub || !connected_.load()) {
+    std::cerr << "Client not connected. Aborting setValue()." << std::endl;
+    return;
+  }
+
   kuksa::val::v1::SetRequest request;
   auto* update = request.add_updates();
   kuksa::val::v1::DataEntry* dataEntry = update->mutable_entry();
@@ -385,6 +645,12 @@ void KuksaClient::setValueInternalImpl(const std::string &entryPath, const T &ne
   grpc::Status status = pImpl->stub->Set(&context, request, &response);
   if (!status.ok()) {
     std::cerr << "Set() RPC failed: " << status.error_message() << std::endl;
+    // Check if this is a connection failure
+    if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
+        status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
+        status.error_message().find("Socket closed") != std::string::npos) {
+      handleConnectionFailure();
+    }
     return;
   }
   if (response.error().code() != 0) {
@@ -458,6 +724,72 @@ bool KuksaClient::convertString(const std::string &str, uint32_t &out) {
   std::istringstream iss(str);
   iss >> out;
   return !iss.fail() && iss.eof();
+}
+
+//=============================================================================
+// Reconnection Helper Methods Implementation
+//=============================================================================
+bool KuksaClient::attemptReconnection() {
+  static int reconnectAttempt = 0;
+  const int maxDelay = 60; // Maximum delay in seconds
+
+  try {
+    std::cout << "Attempting to reconnect to " << serverURI_
+              << " (attempt " << ++reconnectAttempt << ")..." << std::endl;
+
+    pImpl->channel = grpc::CreateChannel(serverURI_, grpc::InsecureChannelCredentials());
+    pImpl->stub = kuksa::val::v1::VAL::NewStub(pImpl->channel);
+
+    // Test the connection with a simple call
+    kuksa::val::v1::GetServerInfoRequest request;
+    kuksa::val::v1::GetServerInfoResponse response;
+    grpc::ClientContext context;
+    grpc::Status status = pImpl->stub->GetServerInfo(&context, request, &response);
+
+    if (status.ok()) {
+      connected_.store(true);
+      reconnectAttempt = 0; // Reset counter on successful connection
+      std::cout << "Successfully reconnected to " << serverURI_ << std::endl;
+      return true;
+    } else {
+      std::cerr << "Reconnection failed: " << status.error_message() << std::endl;
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Reconnection exception: " << e.what() << std::endl;
+  }
+
+  // Exponential backoff with jitter
+  int delay = std::min(1 << std::min(reconnectAttempt - 1, 6), maxDelay);
+  std::this_thread::sleep_for(std::chrono::seconds(delay));
+
+  return false;
+}
+
+void KuksaClient::handleConnectionFailure() {
+  if (connected_.load()) {
+    connected_.store(false);
+    std::cerr << "Connection to " << serverURI_ << " lost. Auto-reconnect: "
+              << (autoReconnect_.load() ? "enabled" : "disabled") << std::endl;
+
+    if (autoReconnect_.load()) {
+      reconnectCV_.notify_one();
+    }
+  }
+}
+
+void KuksaClient::restartSubscriptions() {
+  std::lock_guard<std::mutex> lock(subscriptionsMutex_);
+  std::cout << "Restarting " << activeSubscriptions_.size() << " subscriptions after reconnection" << std::endl;
+
+  // Clear the active subscription paths to allow resubscription after reconnection
+  {
+    std::lock_guard<std::mutex> pathLock(subscriptionPathsMutex_);
+    activeSubscriptionPaths_.clear();
+    std::cout << "Cleared subscription path tracking for reconnection" << std::endl;
+  }
+
+  // The subscribeWithReconnect threads will automatically retry their subscriptions
+  // when they detect connected_ is true again and can now re-register their paths
 }
 
 } // namespace KuksaClient
