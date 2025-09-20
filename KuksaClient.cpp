@@ -768,7 +768,7 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
 
       // Wait before retrying if connection is down and not stopping
       if (!connected_.load() && !shouldStop_.load() && threadActive.load()) {
-        std::cout << "Waiting to retry subscription for " << entryPath << "..." << std::endl;
+        // std::cout << "Waiting to retry subscription for " << entryPath << "..." << std::endl;
 
         // Use shorter sleep intervals and check for shutdown
         for (int i = 0; i < 20 && !shouldStop_.load() && threadActive.load(); ++i) {
