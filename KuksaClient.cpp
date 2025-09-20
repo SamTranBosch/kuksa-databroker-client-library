@@ -263,7 +263,7 @@ void KuksaClient::connect() {
   }
 
   try {
-    std::cout << "Connecting to " << serverURI_ << "..." << std::endl;
+    std::cout << "[KuksaClient] Connecting to " << serverURI_ << " with enhanced K3s networking support..." << std::endl;
 
     // Clean up any existing connection first
     if (pImpl->stub) {
@@ -273,34 +273,107 @@ void KuksaClient::connect() {
       pImpl->channel.reset();
     }
 
-    // Create new connection
-    pImpl->channel = grpc::CreateChannel(serverURI_, grpc::InsecureChannelCredentials());
-    if (!pImpl->channel) {
-      throw std::runtime_error("Failed to create gRPC channel");
+    // Increased delay for K3s container networking stability
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // K3s-optimized connection attempt with extended retry logic
+    const int maxRetries = 5; // Increased for K3s startup delays
+    const int baseDelayMs = 2000; // Longer base delay for K3s networking
+
+    for (int attempt = 1; attempt <= maxRetries; ++attempt) {
+      if (shouldStop_.load()) {
+        throw std::runtime_error("Client shutdown requested during connection");
+      }
+
+      std::cout << "[KuksaClient] Connection attempt " << attempt << "/" << maxRetries
+                << " to " << serverURI_ << std::endl;
+
+      // Create new connection with enhanced channel args for K3s
+      grpc::ChannelArguments args;
+      args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);
+      args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
+      args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+      args.SetInt(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 300000);
+      args.SetInt(GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS, 60000);
+
+      pImpl->channel = grpc::CreateCustomChannel(serverURI_, grpc::InsecureChannelCredentials(), args);
+      if (!pImpl->channel) {
+        throw std::runtime_error("Failed to create gRPC channel");
+      }
+
+      // Wait for channel to be ready (critical for K3s environments)
+      auto channelDeadline = std::chrono::system_clock::now() + std::chrono::seconds(10);
+      if (!pImpl->channel->WaitForConnected(channelDeadline)) {
+        std::cout << "[KuksaClient] Attempt " << attempt << ": Channel connection timeout" << std::endl;
+        if (pImpl->channel) {
+          pImpl->channel.reset();
+        }
+
+        if (attempt < maxRetries) {
+          int delayMs = baseDelayMs * attempt;
+          std::cout << "[KuksaClient] Retrying in " << delayMs << "ms..." << std::endl;
+          std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        }
+        continue;
+      }
+
+      pImpl->stub = kuksa::val::v1::VAL::NewStub(pImpl->channel);
+      if (!pImpl->stub) {
+        throw std::runtime_error("Failed to create gRPC stub");
+      }
+
+      // Test the connection with a simple call
+      kuksa::val::v1::GetServerInfoRequest request;
+      kuksa::val::v1::GetServerInfoResponse response;
+      grpc::ClientContext context;
+
+      // Use shorter timeout for each attempt to fail fast
+      auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(8);
+      context.set_deadline(deadline);
+
+      grpc::Status status = pImpl->stub->GetServerInfo(&context, request, &response);
+
+      if (status.ok()) {
+        connected_.store(true);
+        std::cout << "[KuksaClient] Successfully connected to " << serverURI_ << " on attempt " << attempt << std::endl;
+        return;
+      }
+
+      // Log the failure reason with more specific K3s guidance
+      std::cout << "[KuksaClient] Attempt " << attempt << " failed: " << status.error_message();
+      if (status.error_code() == grpc::StatusCode::UNAVAILABLE) {
+        std::cout << " (K3s service unavailable - container may be starting)";
+      } else if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+        std::cout << " (K3s network timeout - waiting for service)";
+      } else if (status.error_code() == grpc::StatusCode::CANCELLED) {
+        std::cout << " (Connection cancelled - check K3s pod logs)";
+      }
+      std::cout << std::endl;
+
+      // Clean up failed resources before retry
+      if (pImpl->stub) {
+        pImpl->stub.reset();
+      }
+      if (pImpl->channel) {
+        pImpl->channel.reset();
+      }
+
+      // Wait before retry if not the last attempt
+      if (attempt < maxRetries) {
+        int delayMs = baseDelayMs * attempt; // Progressive delay
+        std::cout << "[KuksaClient] Retrying in " << delayMs << "ms..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+      }
     }
 
-    pImpl->stub = kuksa::val::v1::VAL::NewStub(pImpl->channel);
-    if (!pImpl->stub) {
-      throw std::runtime_error("Failed to create gRPC stub");
-    }
+    // All attempts failed
+    connected_.store(false);
+    std::string error_msg = "All " + std::to_string(maxRetries) + " connection attempts failed to " + serverURI_;
+    error_msg += ". K3s service may still be starting up - auto-reconnect will continue trying.";
 
-    // Test the connection with a simple call
-    kuksa::val::v1::GetServerInfoRequest request;
-    kuksa::val::v1::GetServerInfoResponse response;
-    grpc::ClientContext context;
+    std::cerr << "[KuksaClient] " << error_msg << std::endl;
+    throw std::runtime_error(error_msg);
 
-    // Set a reasonable timeout for connection test
-    auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(10);
-    context.set_deadline(deadline);
-
-    grpc::Status status = pImpl->stub->GetServerInfo(&context, request, &response);
-
-    if (!status.ok()) {
-      throw std::runtime_error("Connection test failed: " + status.error_message());
-    }
-
-    connected_.store(true);
-    std::cout << "Successfully connected to " << serverURI_ << std::endl;
   } catch (const std::exception& e) {
     connected_.store(false);
     // Clean up failed connection resources
@@ -310,7 +383,7 @@ void KuksaClient::connect() {
     if (pImpl->channel) {
       pImpl->channel.reset();
     }
-    std::cerr << "Failed to connect to " << serverURI_ << ": " << e.what() << std::endl;
+    std::cerr << "[KuksaClient] Connection failed: " << e.what() << std::endl;
     throw;
   }
 }
@@ -341,7 +414,7 @@ std::string KuksaClient::getTargetValue(const std::string &entryPath) {
 std::string KuksaClient::getValue(const std::string &entryPath, GetView view, bool target) {
   std::string valueStr = "";
   if (!pImpl->stub || !connected_.load()) {
-      std::cerr << "Client not connected. Aborting getValue()" << std::endl;
+      std::cerr << "[KuksaClient] Client not connected. Aborting getValue() for " << entryPath << std::endl;
       return valueStr;
   }
   kuksa::val::v1::GetRequest request;
@@ -358,11 +431,12 @@ std::string KuksaClient::getValue(const std::string &entryPath, GetView view, bo
   grpc::ClientContext context;
   grpc::Status status = pImpl->stub->Get(&context, request, &response);
   if (!status.ok()) {
-      std::cerr << " Get() RPC failed: " << status.error_message() << std::endl;
+      std::cerr << "[KuksaClient] Get() RPC failed for " << entryPath << ": " << status.error_message() << std::endl;
       // Check if this is a connection failure
       if (status.error_code() == grpc::StatusCode::UNAVAILABLE ||
           status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED ||
           status.error_message().find("Socket closed") != std::string::npos) {
+        std::cerr << "[KuksaClient] Detected network failure, triggering reconnection" << std::endl;
         handleConnectionFailure();
       }
       return valueStr;
@@ -589,8 +663,8 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
           // Create fresh gRPC resources for this attempt
           context = std::make_unique<grpc::ClientContext>();
 
-          // Set a reasonable deadline to prevent hanging
-          auto deadline = std::chrono::system_clock::now() + std::chrono::minutes(5);
+          // Set deadline with retry capability for K3s networking
+          auto deadline = std::chrono::system_clock::now() + std::chrono::minutes(10);
           context->set_deadline(deadline);
 
           // Prepare subscription request
@@ -958,7 +1032,7 @@ bool KuksaClient::attemptReconnection() {
   }
 
   try {
-    std::cout << "Attempting to reconnect to " << serverURI_
+    std::cout << "[KuksaClient] Attempting to reconnect to " << serverURI_
               << " (attempt " << ++reconnectAttempt << ")..." << std::endl;
 
     // Clean up existing resources
@@ -968,6 +1042,9 @@ bool KuksaClient::attemptReconnection() {
     if (pImpl->channel) {
       pImpl->channel.reset();
     }
+
+    // K3s-optimized reconnection with adaptive timing
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     // Create new connection
     pImpl->channel = grpc::CreateChannel(serverURI_, grpc::InsecureChannelCredentials());
@@ -985,8 +1062,8 @@ bool KuksaClient::attemptReconnection() {
     kuksa::val::v1::GetServerInfoResponse response;
     grpc::ClientContext context;
 
-    // Set timeout for reconnection test
-    auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+    // Use shorter timeout for reconnection to fail fast and retry
+    auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(8);
     context.set_deadline(deadline);
 
     grpc::Status status = pImpl->stub->GetServerInfo(&context, request, &response);
@@ -994,13 +1071,27 @@ bool KuksaClient::attemptReconnection() {
     if (status.ok()) {
       connected_.store(true);
       reconnectAttempt = 0; // Reset counter on successful connection
-      std::cout << "Successfully reconnected to " << serverURI_ << std::endl;
+      std::cout << "[KuksaClient] Successfully reconnected to " << serverURI_ << std::endl;
       return true;
     } else {
-      std::cerr << "Reconnection failed: " << status.error_message() << std::endl;
+      std::string error_msg = "Reconnection attempt " + std::to_string(reconnectAttempt) + " failed: " + status.error_message();
+      if (status.error_code() == grpc::StatusCode::UNAVAILABLE) {
+        error_msg += " (K3s service may be restarting)";
+      } else if (status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED) {
+        error_msg += " (K3s network delay)";
+      }
+      std::cerr << "[KuksaClient] " << error_msg << std::endl;
+
+      // Clean up failed resources immediately
+      if (pImpl->stub) {
+        pImpl->stub.reset();
+      }
+      if (pImpl->channel) {
+        pImpl->channel.reset();
+      }
     }
   } catch (const std::exception& e) {
-    std::cerr << "Reconnection exception: " << e.what() << std::endl;
+    std::cerr << "[KuksaClient] Reconnection exception (attempt " << reconnectAttempt << "): " << e.what() << std::endl;
     // Clean up failed resources
     if (pImpl->stub) {
       pImpl->stub.reset();
@@ -1010,15 +1101,15 @@ bool KuksaClient::attemptReconnection() {
     }
   }
 
-  // Don't sleep while holding the lock - release and sleep outside
   return false;
 }
 
 void KuksaClient::handleConnectionFailure() {
   if (connected_.load()) {
     connected_.store(false);
-    std::cerr << "Connection to " << serverURI_ << " lost. Auto-reconnect: "
+    std::cerr << "[KuksaClient] Connection to " << serverURI_ << " lost. Auto-reconnect: "
               << (autoReconnect_.load() ? "enabled" : "disabled") << std::endl;
+    std::cerr << "[KuksaClient] This is normal in K3s environments during pod restarts" << std::endl;
 
     if (autoReconnect_.load()) {
       reconnectCV_.notify_one();
