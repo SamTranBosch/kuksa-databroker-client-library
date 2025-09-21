@@ -277,7 +277,7 @@ void KuksaClient::connect() {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // K3s-optimized connection attempt with extended retry logic
-    const int maxRetries = 5; // Increased for K3s startup delays
+    const int maxRetries = 1; // Increased for K3s startup delays
     const int baseDelayMs = 2000; // Longer base delay for K3s networking
 
     for (int attempt = 1; attempt <= maxRetries; ++attempt) {
