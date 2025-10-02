@@ -657,15 +657,20 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
 
     while (!shouldStop_.load() && threadActive.load()) {
       if (connected_.load()) {
+        // Re-register subscription path after reconnection
+        {
+          std::lock_guard<std::mutex> lock(subscriptionPathsMutex_);
+          if (activeSubscriptionPaths_.count(subscriptionKey) == 0) {
+            activeSubscriptionPaths_.insert(subscriptionKey);
+            std::cout << "Re-registered subscription for " << subscriptionKey << " after reconnection" << std::endl;
+          }
+        }
+
         try {
           std::cout << "Attempting to subscribe to " << entryPath << std::endl;
 
           // Create fresh gRPC resources for this attempt
           context = std::make_unique<grpc::ClientContext>();
-
-          // Set deadline with retry capability for K3s networking
-          auto deadline = std::chrono::system_clock::now() + std::chrono::minutes(10);
-          context->set_deadline(deadline);
 
           // Prepare subscription request
           kuksa::val::v1::SubscribeRequest request;
@@ -766,13 +771,17 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
         cleanup();
       }
 
-      // Wait before retrying if connection is down and not stopping
-      if (!connected_.load() && !shouldStop_.load() && threadActive.load()) {
-        // std::cout << "Waiting to retry subscription for " << entryPath << "..." << std::endl;
-
-        // Use shorter sleep intervals and check for shutdown
-        for (int i = 0; i < 20 && !shouldStop_.load() && threadActive.load(); ++i) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      // Wait before retrying - both when disconnected and after failed attempt
+      if (!shouldStop_.load() && threadActive.load()) {
+        if (!connected_.load()) {
+          // Longer wait when disconnected - wait for reconnection
+          for (int i = 0; i < 20 && !shouldStop_.load() && threadActive.load(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
+        } else {
+          // Short delay after failed subscription attempt while still connected
+          // This prevents tight retry loops that can overwhelm the server
+          std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
       }
     }
@@ -1120,6 +1129,11 @@ void KuksaClient::handleConnectionFailure() {
 void KuksaClient::restartSubscriptions() {
   std::lock_guard<std::mutex> lock(subscriptionsMutex_);
   std::cout << "Restarting " << activeSubscriptions_.size() << " subscriptions after reconnection" << std::endl;
+
+  // Wait briefly to let sdv-runtime stabilize after reconnection
+  // This prevents immediate subscription failures due to server not being fully ready
+  std::cout << "Waiting for sdv-runtime to stabilize..." << std::endl;
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
   // Clear the active subscription paths to allow resubscription after reconnection
   {
