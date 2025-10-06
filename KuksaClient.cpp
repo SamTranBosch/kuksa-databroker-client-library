@@ -623,10 +623,9 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
     const auto& [entryPath, userCallback, field, subscriptionKey] = *threadData;
     std::cout << "Starting subscription thread for " << subscriptionKey << std::endl;
 
-    // Local gRPC resources for this thread - avoid shared access
+    // Local gRPC resources for this thread
     std::unique_ptr<grpc::ClientContext> context;
     std::unique_ptr<grpc::ClientReader<kuksa::val::v1::SubscribeResponse>> reader;
-    std::unique_ptr<kuksa::val::v1::VAL::Stub> localStub;
     std::atomic<bool> threadActive{true};
 
     // Cleanup handler to ensure proper resource cleanup between retry attempts
@@ -644,13 +643,6 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
           context.reset();
         } catch (...) {
           std::cerr << "Exception during context cleanup for " << subscriptionKey << std::endl;
-        }
-      }
-      if (localStub) {
-        try {
-          localStub.reset();
-        } catch (...) {
-          std::cerr << "Exception during stub cleanup for " << subscriptionKey << std::endl;
         }
       }
     };
@@ -696,17 +688,19 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
             subEntry->add_fields(kuksa::val::v1::FIELD_VALUE);
           }
 
-          // Thread-safe access to stub with proper synchronization
+          // Use shared stub (gRPC stubs are thread-safe)
+          // Lock only during Subscribe call to ensure stub is not reset
           {
-            // Lock to ensure channel is not being reset during stub creation
             std::lock_guard<std::mutex> lock(connectionMutex_);
-            if (pImpl && pImpl->channel && connected_.load()) {
-              localStub = kuksa::val::v1::VAL::NewStub(pImpl->channel);
+            if (pImpl && pImpl->stub && connected_.load()) {
+              reader = pImpl->stub->Subscribe(context.get(), request);
+            } else {
+              std::cout << "Stub not available for subscription to " << entryPath << std::endl;
+              continue;
             }
           }
 
-          if (localStub) {
-            reader = localStub->Subscribe(context.get(), request);
+          if (reader) {
 
             kuksa::val::v1::SubscribeResponse response;
             int updateCount = 0;
