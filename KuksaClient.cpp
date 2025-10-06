@@ -626,6 +626,7 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
     // Local gRPC resources for this thread - avoid shared access
     std::unique_ptr<grpc::ClientContext> context;
     std::unique_ptr<grpc::ClientReader<kuksa::val::v1::SubscribeResponse>> reader;
+    std::unique_ptr<kuksa::val::v1::VAL::Stub> localStub;
     std::atomic<bool> threadActive{true};
 
     // Cleanup handler to ensure proper resource cleanup between retry attempts
@@ -643,6 +644,13 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
           context.reset();
         } catch (...) {
           std::cerr << "Exception during context cleanup for " << subscriptionKey << std::endl;
+        }
+      }
+      if (localStub) {
+        try {
+          localStub.reset();
+        } catch (...) {
+          std::cerr << "Exception during stub cleanup for " << subscriptionKey << std::endl;
         }
       }
     };
@@ -688,8 +696,7 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
             subEntry->add_fields(kuksa::val::v1::FIELD_VALUE);
           }
 
-          // Thread-safe access to stub with local copy and proper synchronization
-          std::unique_ptr<kuksa::val::v1::VAL::Stub> localStub;
+          // Thread-safe access to stub with proper synchronization
           {
             // Lock to ensure channel is not being reset during stub creation
             std::lock_guard<std::mutex> lock(connectionMutex_);
