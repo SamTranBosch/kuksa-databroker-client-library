@@ -673,47 +673,46 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
         try {
           std::cout << "Attempting to subscribe to " << entryPath << std::endl;
 
-          // Create fresh gRPC resources for this attempt
-          context = std::make_unique<grpc::ClientContext>();
-
-          // Prepare subscription request
-          kuksa::val::v1::SubscribeRequest request;
-          auto* subEntry = request.add_entries();
-          subEntry->set_path(entryPath);
-          subEntry->set_view(kuksa::val::v1::VIEW_ALL);
-
-          if (field == FT_ACTUATOR_TARGET) {
-            subEntry->add_fields(kuksa::val::v1::FIELD_ACTUATOR_TARGET);
-          } else {
-            subEntry->add_fields(kuksa::val::v1::FIELD_VALUE);
-          }
-
-          // Serialize Subscribe() calls to prevent concurrent gRPC issues
-          // Use two locks: one to check stub availability, one to serialize Subscribe calls
-          {
-            std::lock_guard<std::mutex> lock(connectionMutex_);
-            if (!(pImpl && pImpl->stub && connected_.load())) {
-              std::cout << "Stub not available for subscription to " << entryPath << std::endl;
-              continue;
-            }
-          }
-
-          // Serialize all Subscribe() calls across all threads to prevent memory corruption
-          // Add significant delay to let gRPC streams fully initialize (12 subscriptions total)
+          // Serialize EVERYTHING - context, request, and Subscribe() call
+          // Protobuf and gRPC objects are not thread-safe during creation
           {
             std::lock_guard<std::mutex> subscribeLock(subscribeCallMutex_);
 
-            // Longer delay to let previous subscription streams fully stabilize
-            // With 12 subscriptions, we need ~500ms between each to prevent memory corruption
+            // Delay to let previous subscription fully initialize
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
+            // Check connection status
+            {
+              std::lock_guard<std::mutex> lock(connectionMutex_);
+              if (!(pImpl && pImpl->stub && connected_.load())) {
+                std::cout << "Stub not available for subscription to " << entryPath << std::endl;
+                continue;
+              }
+            }
+
+            // Create fresh gRPC resources - MUST be inside serialization lock
+            context = std::make_unique<grpc::ClientContext>();
+
+            // Prepare subscription request - protobuf creation must be serialized
+            kuksa::val::v1::SubscribeRequest request;
+            auto* subEntry = request.add_entries();
+            subEntry->set_path(entryPath);
+            subEntry->set_view(kuksa::val::v1::VIEW_ALL);
+
+            if (field == FT_ACTUATOR_TARGET) {
+              subEntry->add_fields(kuksa::val::v1::FIELD_ACTUATOR_TARGET);
+            } else {
+              subEntry->add_fields(kuksa::val::v1::FIELD_VALUE);
+            }
+
+            // Now make the Subscribe() call
             std::lock_guard<std::mutex> connLock(connectionMutex_);
             if (pImpl && pImpl->stub && connected_.load()) {
               std::cout << "Calling Subscribe for " << entryPath << " field " << field << std::endl;
               reader = pImpl->stub->Subscribe(context.get(), request);
               std::cout << "Subscribe returned for " << entryPath << std::endl;
 
-              // Additional delay after creating stream to ensure gRPC fully initializes it
+              // Delay after creating stream to ensure it's fully initialized
               std::this_thread::sleep_for(std::chrono::milliseconds(300));
             } else {
               std::cout << "Stub became unavailable during subscribe for " << entryPath << std::endl;
