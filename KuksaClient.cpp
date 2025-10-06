@@ -699,13 +699,22 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
           }
 
           // Serialize all Subscribe() calls across all threads to prevent memory corruption
+          // Add significant delay to let gRPC streams fully initialize (12 subscriptions total)
           {
             std::lock_guard<std::mutex> subscribeLock(subscribeCallMutex_);
+
+            // Longer delay to let previous subscription streams fully stabilize
+            // With 12 subscriptions, we need ~500ms between each to prevent memory corruption
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
             std::lock_guard<std::mutex> connLock(connectionMutex_);
             if (pImpl && pImpl->stub && connected_.load()) {
               std::cout << "Calling Subscribe for " << entryPath << " field " << field << std::endl;
               reader = pImpl->stub->Subscribe(context.get(), request);
               std::cout << "Subscribe returned for " << entryPath << std::endl;
+
+              // Additional delay after creating stream to ensure gRPC fully initializes it
+              std::this_thread::sleep_for(std::chrono::milliseconds(300));
             } else {
               std::cout << "Stub became unavailable during subscribe for " << entryPath << std::endl;
               continue;
