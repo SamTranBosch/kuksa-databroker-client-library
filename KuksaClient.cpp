@@ -719,27 +719,35 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
                   const auto &upd = response.updates(i);
                   std::string updatePath = upd.entry().path();
                   std::string updateValue;
+                  bool hasValue = false;
 
-                  // Extract value directly from response instead of making new RPC calls
+                  // Extract value directly from response - no fallback RPC calls
                   if (field == FT_ACTUATOR_TARGET && upd.entry().has_actuator_target()) {
-                    updateValue = DataPointToString(upd.entry().actuator_target());
+                    const auto& dp = upd.entry().actuator_target();
+                    // Check if datapoint actually has a value set
+                    if (dp.value_case() != kuksa::val::v1::Datapoint::VALUE_NOT_SET) {
+                      updateValue = DataPointToString(dp);
+                      hasValue = true;
+                    }
                   } else if (field == FT_VALUE && upd.entry().has_value()) {
-                    updateValue = DataPointToString(upd.entry().value());
-                  } else {
-                    // Fallback to RPC call if data not in response
-                    if (field == FT_ACTUATOR_TARGET) {
-                      updateValue = getTargetValue(entryPath);
-                    } else {
-                      updateValue = getCurrentValue(entryPath);
+                    const auto& dp = upd.entry().value();
+                    // Check if datapoint actually has a value set
+                    if (dp.value_case() != kuksa::val::v1::Datapoint::VALUE_NOT_SET) {
+                      updateValue = DataPointToString(dp);
+                      hasValue = true;
                     }
                   }
 
-                  if (userCallback && !shouldStop_.load()) {
+                  // Only invoke callback if we have a valid value
+                  // Skip unset values to avoid processing incomplete data
+                  if (hasValue && userCallback && !shouldStop_.load()) {
                     try {
                       userCallback(updatePath, updateValue, field);
                     } catch (const std::exception& e) {
                       std::cerr << "Exception in subscription callback for " << entryPath << ": " << e.what() << std::endl;
                     }
+                  } else if (!hasValue) {
+                    std::cout << "Skipping update for " << updatePath << " - value not set" << std::endl;
                   }
                 }
               } catch (const std::exception& e) {
