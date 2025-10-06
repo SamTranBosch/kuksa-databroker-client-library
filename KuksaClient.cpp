@@ -688,14 +688,26 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
             subEntry->add_fields(kuksa::val::v1::FIELD_VALUE);
           }
 
-          // Use shared stub (gRPC stubs are thread-safe)
-          // Lock only during Subscribe call to ensure stub is not reset
+          // Serialize Subscribe() calls to prevent concurrent gRPC issues
+          // Use two locks: one to check stub availability, one to serialize Subscribe calls
           {
             std::lock_guard<std::mutex> lock(connectionMutex_);
-            if (pImpl && pImpl->stub && connected_.load()) {
-              reader = pImpl->stub->Subscribe(context.get(), request);
-            } else {
+            if (!(pImpl && pImpl->stub && connected_.load())) {
               std::cout << "Stub not available for subscription to " << entryPath << std::endl;
+              continue;
+            }
+          }
+
+          // Serialize all Subscribe() calls across all threads to prevent memory corruption
+          {
+            std::lock_guard<std::mutex> subscribeLock(subscribeCallMutex_);
+            std::lock_guard<std::mutex> connLock(connectionMutex_);
+            if (pImpl && pImpl->stub && connected_.load()) {
+              std::cout << "Calling Subscribe for " << entryPath << " field " << field << std::endl;
+              reader = pImpl->stub->Subscribe(context.get(), request);
+              std::cout << "Subscribe returned for " << entryPath << std::endl;
+            } else {
+              std::cout << "Stub became unavailable during subscribe for " << entryPath << std::endl;
               continue;
             }
           }
