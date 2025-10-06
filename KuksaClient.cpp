@@ -222,6 +222,20 @@ KuksaClient::~KuksaClient() {
     std::cerr << "Exception while joining reconnection thread: " << e.what() << std::endl;
   }
 
+  // Reset gRPC resources first to prevent new operations
+  // This must be done under lock to prevent subscription threads from accessing resources
+  try {
+    std::lock_guard<std::mutex> lock(connectionMutex_);
+    if (pImpl) {
+      std::cout << "Cleaning up gRPC resources..." << std::endl;
+      pImpl->stub.reset();
+      pImpl->channel.reset();
+      std::cout << "gRPC resources cleaned up" << std::endl;
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "Exception while cleaning up gRPC resources: " << e.what() << std::endl;
+  }
+
   // Join all subscription threads with timeout
   try {
     joinAllSubscriptionsWithTimeout();
@@ -235,16 +249,6 @@ KuksaClient::~KuksaClient() {
     std::lock_guard<std::mutex> lock2(subscriptionPathsMutex_);
     activeSubscriptions_.clear();
     activeSubscriptionPaths_.clear();
-  }
-
-  // Reset gRPC resources
-  try {
-    if (pImpl) {
-      pImpl->stub.reset();
-      pImpl->channel.reset();
-    }
-  } catch (const std::exception& e) {
-    std::cerr << "Exception while cleaning up gRPC resources: " << e.what() << std::endl;
   }
 
   std::cout << "KuksaClient destructor completed" << std::endl;
@@ -583,31 +587,25 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
   // Create unique key for this subscription (path + field type)
   std::string subscriptionKey = entryPath + "_" + std::to_string(field);
 
-  // Enhanced thread-safe check and registration for duplicate subscriptions
+  // Simplified thread-safe check and registration for duplicate subscriptions
   {
-    std::unique_lock<std::mutex> lock(subscriptionPathsMutex_);
+    std::lock_guard<std::mutex> lock(subscriptionPathsMutex_);
 
-    // Wait for any pending subscription creation to complete for this key
-    while (activeSubscriptionPaths_.count(subscriptionKey + "_PENDING") > 0 && !shouldStop_.load()) {
-      lock.unlock();
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      lock.lock();
-    }
-
+    // Check if subscription already exists
     if (activeSubscriptionPaths_.count(subscriptionKey) > 0) {
       std::cout << "Subscription already exists for " << subscriptionKey << ", skipping duplicate" << std::endl;
       return;
     }
 
-    // Double-check for early termination
+    // Check for early termination
     if (shouldStop_.load()) {
       std::cout << "Client is shutting down, skipping subscription for " << subscriptionKey << std::endl;
       return;
     }
 
-    // Mark as pending to block other threads while we set up this subscription
-    activeSubscriptionPaths_.insert(subscriptionKey + "_PENDING");
+    // Register this subscription immediately
     activeSubscriptionPaths_.insert(subscriptionKey);
+    std::cout << "Registered new subscription for " << subscriptionKey << std::endl;
   }
 
   // Store subscription info for restart after reconnection
@@ -625,20 +623,14 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
     const auto& [entryPath, userCallback, field, subscriptionKey] = *threadData;
     std::cout << "Starting subscription thread for " << subscriptionKey << std::endl;
 
-    // Clear the pending marker now that thread is running
-    {
-      std::lock_guard<std::mutex> lock(subscriptionPathsMutex_);
-      activeSubscriptionPaths_.erase(subscriptionKey + "_PENDING");
-    }
-
     // Local gRPC resources for this thread - avoid shared access
     std::unique_ptr<grpc::ClientContext> context;
     std::unique_ptr<grpc::ClientReader<kuksa::val::v1::SubscribeResponse>> reader;
     std::atomic<bool> threadActive{true};
 
-    // Cleanup handler to ensure proper resource cleanup on thread exit
+    // Cleanup handler to ensure proper resource cleanup between retry attempts
+    // NOTE: This does NOT set threadActive to false - thread should continue retrying
     auto cleanup = [&]() {
-      threadActive.store(false);
       if (reader) {
         try {
           reader.reset();
@@ -656,7 +648,19 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
     };
 
     while (!shouldStop_.load() && threadActive.load()) {
+      // Wait for stable connection before attempting subscription
+      while (!connected_.load() && !shouldStop_.load() && threadActive.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+
+      if (shouldStop_.load() || !threadActive.load()) {
+        break;
+      }
+
       if (connected_.load()) {
+        // Add minimum delay after connection before subscribing to ensure server stability
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
         // Re-register subscription path after reconnection
         {
           std::lock_guard<std::mutex> lock(subscriptionPathsMutex_);
@@ -684,11 +688,12 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
             subEntry->add_fields(kuksa::val::v1::FIELD_VALUE);
           }
 
-          // Thread-safe access to stub with local copy
+          // Thread-safe access to stub with local copy and proper synchronization
           std::unique_ptr<kuksa::val::v1::VAL::Stub> localStub;
           {
-            // Brief lock to copy stub pointer - minimize contention
-            if (pImpl && pImpl->stub) {
+            // Lock to ensure channel is not being reset during stub creation
+            std::lock_guard<std::mutex> lock(connectionMutex_);
+            if (pImpl && pImpl->channel && connected_.load()) {
               localStub = kuksa::val::v1::VAL::NewStub(pImpl->channel);
             }
           }
@@ -786,14 +791,14 @@ void KuksaClient::subscribeWithReconnect(const std::string &entryPath,
       }
     }
 
-    // Final cleanup
+    // Final cleanup when truly exiting thread
+    threadActive.store(false);
     cleanup();
 
     // Remove from active subscriptions when thread exits
     {
       std::lock_guard<std::mutex> lock(subscriptionPathsMutex_);
       activeSubscriptionPaths_.erase(subscriptionKey);
-      activeSubscriptionPaths_.erase(subscriptionKey + "_PENDING");
     }
 
     std::cout << "Subscription thread ending for " << subscriptionKey << std::endl;
@@ -1044,12 +1049,17 @@ bool KuksaClient::attemptReconnection() {
     std::cout << "[KuksaClient] Attempting to reconnect to " << serverURI_
               << " (attempt " << ++reconnectAttempt << ")..." << std::endl;
 
-    // Clean up existing resources
-    if (pImpl->stub) {
-      pImpl->stub.reset();
-    }
-    if (pImpl->channel) {
-      pImpl->channel.reset();
+    // Clean up existing resources safely
+    if (pImpl) {
+      if (pImpl->stub) {
+        pImpl->stub.reset();
+      }
+      if (pImpl->channel) {
+        pImpl->channel.reset();
+      }
+    } else {
+      std::cerr << "[KuksaClient] pImpl is null during reconnection, aborting" << std::endl;
+      return false;
     }
 
     // K3s-optimized reconnection with adaptive timing
@@ -1092,21 +1102,25 @@ bool KuksaClient::attemptReconnection() {
       std::cerr << "[KuksaClient] " << error_msg << std::endl;
 
       // Clean up failed resources immediately
+      if (pImpl) {
+        if (pImpl->stub) {
+          pImpl->stub.reset();
+        }
+        if (pImpl->channel) {
+          pImpl->channel.reset();
+        }
+      }
+    }
+  } catch (const std::exception& e) {
+    std::cerr << "[KuksaClient] Reconnection exception (attempt " << reconnectAttempt << "): " << e.what() << std::endl;
+    // Clean up failed resources
+    if (pImpl) {
       if (pImpl->stub) {
         pImpl->stub.reset();
       }
       if (pImpl->channel) {
         pImpl->channel.reset();
       }
-    }
-  } catch (const std::exception& e) {
-    std::cerr << "[KuksaClient] Reconnection exception (attempt " << reconnectAttempt << "): " << e.what() << std::endl;
-    // Clean up failed resources
-    if (pImpl->stub) {
-      pImpl->stub.reset();
-    }
-    if (pImpl->channel) {
-      pImpl->channel.reset();
     }
   }
 
@@ -1142,8 +1156,16 @@ void KuksaClient::restartSubscriptions() {
     std::cout << "Cleared subscription path tracking for reconnection" << std::endl;
   }
 
+  // Notify all subscription threads to retry now that connection is restored
   // The subscribeWithReconnect threads will automatically retry their subscriptions
   // when they detect connected_ is true again and can now re-register their paths
+  std::cout << "Notifying subscription threads to retry..." << std::endl;
+  for (const auto& sub : activeSubscriptions_) {
+    std::cout << "  - " << sub.entryPath << " (field: " << sub.field << ") will auto-retry" << std::endl;
+  }
+
+  // Wake up subscription threads that might be waiting
+  reconnectCV_.notify_all();
 }
 
 } // namespace KuksaClient
