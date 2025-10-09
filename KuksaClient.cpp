@@ -990,9 +990,9 @@ void KuksaClient::setValueInternalImpl(const std::string &entryPath, const T &ne
     std::cerr << "Set() global error: " << response.error().message() << std::endl;
   } else {
     if (field == FT_ACTUATOR_TARGET) {
-      std::cout << "SetTargetValue(): Updated \"" << entryPath << "\" - " << (int)newValue << std::endl;
+      std::cout << "SetTargetValue(): Updated \"" << entryPath << "\" - " << newValue << std::endl;
     } else { // FT_VALUE
-      std::cout << "SetCurrentValue(): Updated \"" << entryPath << "\" - " << (int)newValue << std::endl;
+      std::cout << "SetCurrentValue(): Updated \"" << entryPath << "\" - " << newValue << std::endl;
     }
   }
 }
@@ -1009,6 +1009,7 @@ template void KuksaClient::setValueInternalImpl<int32_t>(const std::string&, con
 template void KuksaClient::setValueInternalImpl<int64_t>(const std::string&, const int64_t&, int);
 template void KuksaClient::setValueInternalImpl<float>(const std::string&, const float&, int);
 template void KuksaClient::setValueInternalImpl<double>(const std::string&, const double&, int);
+template void KuksaClient::setValueInternalImpl<std::string>(const std::string&, const std::string&, int);
 
 // Note: If you plan to use setValueInternalImpl with additional types,
 // you can explicitly instantiate them here.

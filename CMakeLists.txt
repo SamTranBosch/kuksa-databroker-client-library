@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(kuksa_databroker)
 
-# Use C++11 standard.
-set(CMAKE_CXX_STANDARD 14)
+# Use C++17 standard.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find the required packages.
@@ -73,9 +73,10 @@ set(GENERATED_HDRS
 )
 
 # Define your library source files.
-# The shared library will be built from KuksaClient.cpp and the generated sources.
-set(LIB_SOURCES 
+# The shared library will be built from KuksaClient.cpp, vapiclient.cpp and the generated sources.
+set(LIB_SOURCES
     KuksaClient.cpp
+    vapiclient.cpp
     ${GENERATED_SRCS}
 )
 
@@ -90,8 +91,9 @@ target_link_libraries(KuksaClient
     PUBLIC gRPC::grpc++ protobuf::libprotobuf
 )
 
-# install lib
-install(TARGETS KuksaClient      DESTINATION lib)
+# install lib and headers
+install(TARGETS KuksaClient DESTINATION lib)
+install(FILES KuksaClient.hpp vapiclient.hpp DESTINATION include)
 
 
 # Create an executable target for the client.

@@ -78,9 +78,10 @@ COPY . /app
 
 # Create and move into a build directory, then configure and build the project.
 # We pass the gRPC_DIR so that CMake can find the gRPC installation.
+# Build only the library target, not the test executable
 RUN mkdir -p build && cd build && \
     cmake -DgRPC_DIR=/usr/local/lib/cmake/grpc .. && \
-    make -j$(nproc)
+    make -j$(nproc) KuksaClient
 
 # ----------------------------------------------------------------------------------
 # Stage 3: Create a minimal runtime container with the built binary.
@@ -103,11 +104,8 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/bin
 # Copy installed libraries (if needed) from the builder stage.
 COPY --from=builder /usr/local/ /usr/local/
 
-# Copy the built executable from the builder stage.
-# Adjust the built executable name as necessary (here assumed as "KuksaDatabrokerClient").
+# Copy the built library from the builder stage.
 COPY --from=builder /app/build/libKuksaClient.so /usr/local/bin
-COPY --from=builder /app/build/KuksaDatabrokerClient /usr/local/bin/KuksaDatabrokerClient
-COPY --from=builder /app/config.json /usr/local/bin/config.json
 # COPY --from=builder /app/build /usr/local/bin/build
 
 # Make sure the startup script has executable permissions.
