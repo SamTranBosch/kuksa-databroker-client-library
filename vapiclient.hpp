@@ -121,11 +121,11 @@ private:
   // one entry per connected server
   struct ClientEntry {
     std::unique_ptr<KuksaClient::KuksaClient> client;
-    std::vector<std::thread>                  subThreads;
+    // Note: No thread management needed - KuksaClient handles everything via RAII
   };
 
   std::unordered_map<std::string, ClientEntry> mClients_;
-  mutable std::mutex                          mClientsMtx_;
+  mutable std::mutex                           mClientsMtx_;
 };
 
 // convenience macro

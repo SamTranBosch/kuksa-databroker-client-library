@@ -44,4 +44,16 @@ for platform in "${platforms[@]}"; do
   echo "=================================================="
 done
 
+# Copy headers to artifact/ for distribution
+echo "=================================================="
+echo "Copying headers to artifact/ directory"
+artifact_dir="$PWD/artifact"
+mkdir -p "${artifact_dir}"
+
+cp KuksaClient.hpp "${artifact_dir}/"
+cp vapiclient.hpp "${artifact_dir}/"
+
+echo "Headers copied to ${artifact_dir}"
+echo "=================================================="
+
 echo "Build and copy process completed successfully."

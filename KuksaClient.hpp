@@ -1,252 +1,492 @@
 // Copyright (c) 2025 Eclipse Foundation.
-// 
+//
 // This program and the accompanying materials are made available under the
 // terms of the MIT License which is available at
 // https://opensource.org/licenses/MIT.
-// 
+//
 // SPDX-License-Identifier: MIT
+
+/**
+ * @file KuksaClient.hpp
+ * @brief Thread-safe gRPC client for KUKSA Databroker
+ *
+ * This library provides a simplified, type-safe interface for communicating
+ * with KUKSA Databroker using gRPC. It handles connection management,
+ * automatic reconnection, and subscription lifecycle automatically.
+ *
+ * Key Features:
+ * - Automatic connection management with exponential backoff retry
+ * - Type-safe value get/set operations
+ * - Thread-safe subscription management with automatic reconnection
+ * - Clean RAII design - no manual resource cleanup needed
+ * - Hidden gRPC implementation details (pImpl pattern)
+ *
+ * Example Usage:
+ * @code
+ *   KuksaClient::Config config;
+ *   config.serverURI = "127.0.0.1:55555";
+ *   config.signalPaths = {"Vehicle.Speed", "Vehicle.Gear"};
+ *
+ *   KuksaClient::KuksaClient client(config);
+ *   client.connect();
+ *
+ *   // Get value with automatic type conversion
+ *   float speed;
+ *   if (client.getCurrentValue("Vehicle.Speed", speed)) {
+ *       std::cout << "Speed: " << speed << " km/h" << std::endl;
+ *   }
+ *
+ *   // Set value
+ *   client.setCurrentValue("Vehicle.Gear", 3);
+ *
+ *   // Subscribe to updates
+ *   client.subscribeCurrentValue("Vehicle.Speed",
+ *       [](const std::string& path, const std::string& value, int field) {
+ *           std::cout << path << " = " << value << std::endl;
+ *       }
+ *   );
+ *
+ *   // Destructor automatically handles cleanup - no manual join needed!
+ * @endcode
+ *
+ * Thread Safety:
+ * - All public methods are thread-safe
+ * - Callbacks are invoked from subscription threads
+ * - User callbacks should not block for extended periods
+ *
+ * Memory Safety:
+ * - Uses RAII for all resource management
+ * - Automatic cleanup on destruction
+ * - No manual thread joining required
+ * - Safe to destroy even with active subscriptions
+ */
+
 #ifndef KUKSA_CLIENT_HPP
 #define KUKSA_CLIENT_HPP
 
 #include <cstdint>
-#include <fstream>
 #include <functional>
-#include <iostream>
-#include <limits>
 #include <memory>
-#include <sstream>
-#include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 #include <set>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
-#include <chrono>
-
+#include <sstream>
+#include <thread>
 
 namespace KuksaClient {
 
-//------------------------------------------------------------------------------
-// Configuration structure declaration
-//------------------------------------------------------------------------------
-struct Config {
-  std::string serverURI;
-  bool debug = false;
-  std::vector<std::string> signalPaths;
-};
+//==============================================================================
+// Type Definitions
+//==============================================================================
 
-//------------------------------------------------------------------------------
-// Local enumeration for field types (for set operations)
-//------------------------------------------------------------------------------
+/**
+ * @brief Field type identifier for value operations
+ */
 enum FieldType {
-  FT_VALUE = 1,           // For setting the “current” value
-  FT_ACTUATOR_TARGET = 2  // For setting the “target” actuator value
+  FT_VALUE = 1,           ///< Current value field
+  FT_ACTUATOR_TARGET = 2  ///< Actuator target value field
 };
 
-//------------------------------------------------------------------------------
-// Local enumeration for get views
-//------------------------------------------------------------------------------
-enum GetView {
-  GV_CURRENT = 0,
-  GV_TARGET = 1,
-  GV_ALL = 2
+/**
+ * @brief Callback signature for subscription updates
+ *
+ * @param entryPath The VSS path that was updated (e.g., "Vehicle.Speed")
+ * @param value The new value as a string
+ * @param field The field type (FT_VALUE or FT_ACTUATOR_TARGET)
+ *
+ * @note This callback is invoked from a subscription thread.
+ *       Keep processing fast to avoid blocking other updates.
+ *       Do not call blocking operations or long computations here.
+ */
+using SubscribeCallback = std::function<void(
+    const std::string &entryPath,
+    const std::string &value,
+    const int &field
+)>;
+
+//==============================================================================
+// Configuration
+//==============================================================================
+
+/**
+ * @brief Configuration structure for KuksaClient
+ */
+struct Config {
+  std::string serverURI;                 ///< Broker address (e.g., "127.0.0.1:55555")
+  bool debug = false;                    ///< Enable debug logging
+  std::vector<std::string> signalPaths;  ///< VSS paths for bulk operations
 };
 
-//------------------------------------------------------------------------------
-// KuksaClient Class Declaration
-// 
-// This class hides all gRPC/Proto details behind a private implementation (pImpl).
-// No gRPC or proto types appear anywhere in this header.
-//------------------------------------------------------------------------------
+//==============================================================================
+// Main Client Class
+//==============================================================================
+
+/**
+ * @brief Thread-safe gRPC client for KUKSA Databroker
+ *
+ * This class provides a high-level interface to KUKSA Databroker with
+ * automatic connection management, type-safe operations, and thread-safe
+ * subscriptions with automatic reconnection.
+ *
+ * Design Patterns:
+ * - pImpl: All gRPC details hidden in private implementation
+ * - RAII: Automatic resource cleanup on destruction
+ * - Thread-safe: All public methods can be called from multiple threads
+ *
+ * Lifecycle:
+ * 1. Construct with Config or config file
+ * 2. Call connect() to establish connection
+ * 3. Use get/set/subscribe methods
+ * 4. Destructor automatically cleans up all resources
+ *
+ * @note Non-copyable and non-movable (manages threads internally)
+ */
 class KuksaClient {
 public:
-  // Constructors & Destructor
+  //============================================================================
+  // Construction & Destruction
+  //============================================================================
+
+  /**
+   * @brief Construct client from configuration structure
+   *
+   * @param config Client configuration
+   * @throws std::runtime_error if initialization fails
+   *
+   * @note Does not connect automatically - call connect() explicitly
+   */
   explicit KuksaClient(const Config &config);
+
+  /**
+   * @brief Construct client from JSON configuration file
+   *
+   * @param configFile Path to JSON configuration file
+   * @throws std::runtime_error if file cannot be read or parsed
+   *
+   * Expected JSON format:
+   * @code{.json}
+   * {
+   *   "broker": {
+   *     "serverURI": "127.0.0.1:55555"
+   *   },
+   *   "debug": false,
+   *   "signal": [
+   *     { "path": "Vehicle.Speed" },
+   *     { "path": "Vehicle.Gear" }
+   *   ]
+   * }
+   * @endcode
+   */
   explicit KuksaClient(const std::string &configFile);
+
+  /**
+   * @brief Destructor - automatically cleans up all resources
+   *
+   * Performs the following cleanup sequence:
+   * 1. Signals all threads to stop
+   * 2. Cancels all active gRPC operations
+   * 3. Joins all subscription threads (with cancellation, no timeout needed)
+   * 4. Cleans up connection resources
+   *
+   * @note Safe to call even with active subscriptions
+   * @note Blocks until all threads have exited (but they exit quickly due to cancellation)
+   */
   ~KuksaClient();
 
-  //--------------------------------------------------------------------------
-  // Public API: Connection & Data Operations
-  //--------------------------------------------------------------------------
+  // Non-copyable and non-movable
+  KuksaClient(const KuksaClient&) = delete;
+  KuksaClient& operator=(const KuksaClient&) = delete;
+  KuksaClient(KuksaClient&&) = delete;
+  KuksaClient& operator=(KuksaClient&&) = delete;
 
-  // Establish connection to the broker server.
+  //============================================================================
+  // Connection Management
+  //============================================================================
+
+  /**
+   * @brief Establish connection to the KUKSA Databroker
+   *
+   * @throws std::runtime_error if connection fails after all retries
+   *
+   * @note Includes built-in retry logic with exponential backoff
+   * @note If auto-reconnect is enabled, connection will be restored automatically
+   */
   void connect();
 
-  // Check if client is currently connected
+  /**
+   * @brief Check current connection status
+   *
+   * @return true if connected, false otherwise
+   *
+   * @note Thread-safe
+   */
   bool isConnected() const;
 
-  // Enable/disable automatic reconnection (default: enabled)
+  /**
+   * @brief Enable or disable automatic reconnection
+   *
+   * @param enabled true to enable, false to disable
+   *
+   * When enabled, the client will automatically attempt to reconnect
+   * if the connection is lost. Subscriptions are automatically restarted
+   * after successful reconnection.
+   *
+   * @note Auto-reconnect is enabled by default
+   * @note Thread-safe
+   */
   void setAutoReconnect(bool enabled);
 
-  // Force a reconnection attempt
-  bool reconnect();
+  //============================================================================
+  // Get Operations
+  //============================================================================
 
-  // Get the current value for an entry as a string.
-  std::string getCurrentValue(const std::string &entryPath);
-
-  // Get the target (actuator) value for an entry as a string.
-  std::string getTargetValue(const std::string &entryPath);
-
-  //--------------------------------------------------------------------------
-  // Conversion API: Retrieve and convert values.
-  // The templated functions call the string‐based getter and then perform a conversion.
-  //--------------------------------------------------------------------------
+  /**
+   * @brief Get current value with automatic type conversion
+   *
+   * @tparam T Target type (int, float, double, bool, uint8_t, std::string, etc.)
+   * @param entryPath VSS path (e.g., "Vehicle.Speed")
+   * @param out Output variable to store the converted value
+   * @return true if value was retrieved and converted successfully
+   *
+   * @note Thread-safe
+   * @note Returns false if not connected or conversion fails
+   *
+   * Example:
+   * @code
+   *   float speed;
+   *   if (client.getCurrentValue("Vehicle.Speed", speed)) {
+   *       std::cout << "Speed: " << speed << std::endl;
+   *   }
+   * @endcode
+   */
   template <typename T>
-  bool getCurrentValueAs(const std::string &entryPath, T &out) {
-    std::string strVal = getCurrentValue(entryPath);
-    return convertString(strVal, out);
-  }
+  bool getCurrentValue(const std::string &entryPath, T &out);
 
+  /**
+   * @brief Get target (actuator) value with automatic type conversion
+   *
+   * @tparam T Target type (int, float, double, bool, uint8_t, std::string, etc.)
+   * @param entryPath VSS path
+   * @param out Output variable to store the converted value
+   * @return true if value was retrieved and converted successfully
+   *
+   * @note Thread-safe
+   * @note Returns false if not connected or conversion fails
+   */
   template <typename T>
-  bool getTargetValueAs(const std::string &entryPath, T &out) {
-    std::string strVal = getTargetValue(entryPath);
-    return convertString(strVal, out);
-  }
+  bool getTargetValue(const std::string &entryPath, T &out);
 
-  // Stream an update to an entry.
-  void streamUpdate(const std::string &entryPath, float newValue);
+  //============================================================================
+  // Set Operations
+  //============================================================================
 
-  //--------------------------------------------------------------------------
-  // Set Value API: Set current (or target) value for an entry.
-  //--------------------------------------------------------------------------
+  /**
+   * @brief Set current value with automatic type conversion
+   *
+   * @tparam T Value type (int, float, double, bool, uint8_t, std::string, etc.)
+   * @param entryPath VSS path
+   * @param newValue Value to set
+   *
+   * @note Thread-safe
+   * @note Silent failure if not connected
+   *
+   * Example:
+   * @code
+   *   client.setCurrentValue("Vehicle.Gear", 3);
+   *   client.setCurrentValue("Vehicle.IsParked", true);
+   * @endcode
+   */
   template <typename T>
-  void setCurrentValue(const std::string &entryPath, const T &newValue) {
-    setValueInternal(entryPath, newValue, FT_VALUE);
-  }
+  void setCurrentValue(const std::string &entryPath, const T &newValue);
 
+  /**
+   * @brief Set target (actuator) value with automatic type conversion
+   *
+   * @tparam T Value type (int, float, double, bool, uint8_t, std::string, etc.)
+   * @param entryPath VSS path
+   * @param newValue Value to set
+   *
+   * @note Thread-safe
+   * @note Silent failure if not connected
+   */
   template <typename T>
-  void setTargetValue(const std::string &entryPath, const T &newValue) {
-    setValueInternal(entryPath, newValue, FT_ACTUATOR_TARGET);
-  }
+  void setTargetValue(const std::string &entryPath, const T &newValue);
 
-  //--------------------------------------------------------------------------
-  // Subscription APIs
-  //--------------------------------------------------------------------------
-  
-  void subscribeTargetValue(const std::string &entryPath,
-                  std::function<void(const std::string &, const std::string &, const int &)> userCallback);
+  //============================================================================
+  // Subscription Operations
+  //============================================================================
 
-  void subscribeCurrentValue(const std::string &entryPath,
-                  std::function<void(const std::string &, const std::string &, const int &)> userCallback);
-  // Subscribe to updates for a specific entry.
-  // The provided callback is invoked with (entryPath, updateValue) for every update.
-  void subscribe(const std::string &entryPath,
-                  std::function<void(const std::string &, const std::string &, const int &)> userCallback, int field);
+  /**
+   * @brief Subscribe to current value updates
+   *
+   * @param entryPath VSS path to subscribe to
+   * @param callback Function to call on each update
+   *
+   * Features:
+   * - Automatic reconnection: subscription survives connection loss
+   * - Thread-per-subscription: each runs in its own thread
+   * - Duplicate prevention: ignores duplicate subscription requests
+   * - Automatic cleanup: threads cleaned up on destruction
+   *
+   * @note Thread-safe
+   * @note Callback is invoked from subscription thread - keep it fast!
+   * @note Subscription persists until object destruction
+   *
+   * Example:
+   * @code
+   *   client.subscribeCurrentValue("Vehicle.Speed",
+   *       [](const std::string& path, const std::string& value, int field) {
+   *           std::cout << path << " changed to " << value << std::endl;
+   *       }
+   *   );
+   * @endcode
+   */
+  void subscribeCurrentValue(const std::string &entryPath, SubscribeCallback callback);
 
-  // Enhanced subscribe with automatic reconnection
-  void subscribeWithReconnect(const std::string &entryPath,
-                             std::function<void(const std::string &, const std::string &, const int &)> userCallback,
-                             int field);
+  /**
+   * @brief Subscribe to target (actuator) value updates
+   *
+   * @param entryPath VSS path to subscribe to
+   * @param callback Function to call on each update
+   *
+   * @note Thread-safe
+   * @note See subscribeCurrentValue() for details
+   */
+  void subscribeTargetValue(const std::string &entryPath, SubscribeCallback callback);
 
-  // Subscribe to all signal paths (from our configuration).
-  // Each subscription runs in its own thread.
-  void subscribeAll(std::function<void(const std::string &, const std::string &, const int &)> userCallback);
+  /**
+   * @brief Generic subscribe with field type selector
+   *
+   * @param entryPath VSS path to subscribe to
+   * @param field Field type (FT_VALUE or FT_ACTUATOR_TARGET)
+   * @param callback Function to call on each update
+   *
+   * @note Thread-safe
+   * @note Prefer using subscribeCurrentValue() or subscribeTargetValue() instead
+   */
+  void subscribe(const std::string &entryPath, FieldType field, SubscribeCallback callback);
 
-  // Wait for all subscription threads to finish.
-  void joinAllSubscriptions();
+  //============================================================================
+  // Utility Methods
+  //============================================================================
 
-  // Wait for all subscription threads to finish with timeout.
-  void joinAllSubscriptionsWithTimeout();
-
-  // Detach all subscription threads.
-  void detachAllSubscriptions();
-
-  // Retrieve broker server info.
-  void getServerInfo();
-
-  //--------------------------------------------------------------------------
-  // Static Helper: Parse a configuration file into a Config structure.
-  //--------------------------------------------------------------------------
+  /**
+   * @brief Parse JSON configuration file
+   *
+   * @param filename Path to configuration file
+   * @param config Output configuration structure
+   * @return true if parsing succeeded
+   *
+   * @note Static method - can be called without an instance
+   */
   static bool parseConfig(const std::string &filename, Config &config);
 
 private:
-  //--------------------------------------------------------------------------
-  // Private Helper Functions
-  //--------------------------------------------------------------------------
-  // Common function used by getCurrentValue() and getTargetValue().
-  // It uses our local GetView enumeration.
-  std::string getValue(const std::string &entryPath, GetView view, bool target);
+  //============================================================================
+  // Private Implementation
+  //============================================================================
 
-  // Templated helper used to set values.
-  // Its implementation is provided in the CPP file.
-  template <typename T>
-  void setValueInternal(const std::string &entryPath, const T &newValue, int field) {
-    setValueInternalImpl(entryPath, newValue, field);
-  }
+  // Forward declarations
+  struct Impl;
+  struct SubscriptionContext;
 
-  // Non-templated implementation helper (definition is in the CPP file).
-  template <typename T>
-  void setValueInternalImpl(const std::string &entryPath, const T &newValue, int field);
+  // Private helper methods
+  std::string getValueInternal(const std::string &entryPath, FieldType field);
 
-  //--------------------------------------------------------------------------
-  // Private Helper: Conversion from string to a standard type.
-  // Returns true if conversion succeeded.
-  //--------------------------------------------------------------------------
   template <typename T>
-  static bool convertString(const std::string &str, T &out) {
-    std::istringstream iss(str);
-    iss >> out;
-    return !iss.fail() && iss.eof();
-  }
+  void setValueInternalImpl(const std::string &entryPath, const T &newValue, FieldType field);
+
+  template <typename T>
+  static bool convertString(const std::string &str, T &out);
+
   static bool convertString(const std::string &str, bool &out);
   static bool convertString(const std::string &str, uint8_t &out);
   static bool convertString(const std::string &str, uint16_t &out);
   static bool convertString(const std::string &str, uint32_t &out);
 
-  //--------------------------------------------------------------------------
-  // Private Helper Methods for Reconnection
-  //--------------------------------------------------------------------------
+  // Reconnection helpers
   bool attemptReconnection();
   void handleConnectionFailure();
   void restartSubscriptions();
 
-  //--------------------------------------------------------------------------
-  // Private Members
-  //--------------------------------------------------------------------------
-  // All gRPC/Proto-related members are hidden in the implementation.
-  struct Impl;
-  std::unique_ptr<Impl> pImpl;
+  // Subscription thread management
+  void subscriptionThreadFunc(std::shared_ptr<SubscriptionContext> ctx);
+  void cleanupSubscriptionThread(const std::string &subscriptionKey);
 
-  // We also store configuration items directly.
+  //============================================================================
+  // Private Members
+  //============================================================================
+
+  // pImpl - hides all gRPC details from header
+  std::unique_ptr<Impl> pImpl_;
+
+  // Configuration
+  Config config_;
   std::string serverURI_;
   bool debug_{false};
-  Config config_;
-  std::vector<std::string> signalPaths_;
 
-  // Threads dedicated to subscription updates.
-  std::vector<std::thread> subscriptionThreads_;
-
-  // Track active subscription paths to prevent duplicates
-  std::set<std::string> activeSubscriptionPaths_;
-  std::mutex subscriptionPathsMutex_;
-
-  // Connection state management
+  // Connection state
   mutable std::atomic<bool> connected_{false};
   std::atomic<bool> autoReconnect_{true};
   std::atomic<bool> shouldStop_{false};
 
-  // Connection synchronization
+  // Synchronization primitives
   mutable std::mutex connectionMutex_;
-
-  // Reconnection mechanism
+  std::mutex subscriptionsMutex_;
   std::mutex reconnectMutex_;
   std::condition_variable reconnectCV_;
-  std::thread reconnectThread_;
 
-  // Active subscription tracking for restart after reconnection
+  // Thread management
+  std::thread reconnectThread_;
+  std::vector<std::shared_ptr<SubscriptionContext>> subscriptionContexts_;
+
+  // Subscription tracking
   struct SubscriptionInfo {
     std::string entryPath;
-    std::function<void(const std::string &, const std::string &, const int &)> callback;
-    int field;
+    SubscribeCallback callback;
+    FieldType field;
   };
   std::vector<SubscriptionInfo> activeSubscriptions_;
-  std::mutex subscriptionsMutex_;
-
-  // Serialize gRPC Subscribe() calls to prevent concurrent access issues
-  std::mutex subscribeCallMutex_;
+  std::set<std::string> activeSubscriptionKeys_;
 };
+
+//==============================================================================
+// Template Implementations
+//==============================================================================
+
+template <typename T>
+bool KuksaClient::getCurrentValue(const std::string &entryPath, T &out) {
+  std::string strVal = getValueInternal(entryPath, FT_VALUE);
+  if (strVal.empty()) return false;
+  return convertString(strVal, out);
+}
+
+template <typename T>
+bool KuksaClient::getTargetValue(const std::string &entryPath, T &out) {
+  std::string strVal = getValueInternal(entryPath, FT_ACTUATOR_TARGET);
+  if (strVal.empty()) return false;
+  return convertString(strVal, out);
+}
+
+template <typename T>
+void KuksaClient::setCurrentValue(const std::string &entryPath, const T &newValue) {
+  setValueInternalImpl(entryPath, newValue, FT_VALUE);
+}
+
+template <typename T>
+void KuksaClient::setTargetValue(const std::string &entryPath, const T &newValue) {
+  setValueInternalImpl(entryPath, newValue, FT_ACTUATOR_TARGET);
+}
+
+template <typename T>
+bool KuksaClient::convertString(const std::string &str, T &out) {
+  std::istringstream iss(str);
+  iss >> out;
+  return !iss.fail() && iss.eof();
+}
 
 } // namespace KuksaClient
 
