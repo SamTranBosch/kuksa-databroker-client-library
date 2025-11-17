@@ -115,3 +115,17 @@ target_include_directories(KuksaDatabrokerClient PRIVATE ${GENERATED_DIR} ${Prot
 
 # Link the executable against the shared library.
 target_link_libraries(KuksaDatabrokerClient PRIVATE KuksaClient)
+
+
+# Create test executable for VSS signal testing
+set(TEST_SRCS test_vss_signals.cpp)
+add_executable(VSSSignalTester ${TEST_SRCS})
+
+target_include_directories(VSSSignalTester PRIVATE ${GENERATED_DIR} ${Protobuf_INCLUDE_DIRS})
+target_link_libraries(VSSSignalTester PRIVATE KuksaClient)
+
+# Set RPATH for the test executable
+set_target_properties(VSSSignalTester PROPERTIES
+    BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR}"
+    INSTALL_RPATH "$ORIGIN"
+)

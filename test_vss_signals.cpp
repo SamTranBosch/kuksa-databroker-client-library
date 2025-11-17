@@ -1,14 +1,7 @@
 /**
- * VSS Signal End-to-End Test Suite (Main Executable)
- *
- * This is the main test executable that tests all VSS signals
- * with full write-read-verify cycle.
- *
- * Handles unavailable signals gracefully by attempting to write,
- * then reading back to verify. If read fails, signal is marked as unavailable.
- *
- * Usage: ./KuksaDatabrokerClient [databroker_uri]
- * Example: ./KuksaDatabrokerClient 127.0.0.1:55555
+ * End-to-End VSS Signal Test Suite
+ * Tests sensor and actuator signals with full write-read-verify cycle
+ * Handles unavailable signals gracefully
  */
 
 #include "KuksaClient.hpp"
@@ -80,11 +73,10 @@ public:
 
     // ==================== END-TO-END TESTS (WRITE-READ-VERIFY) ====================
 
-    // Test sensors using current value API
     template<typename T>
     void testE2E(const std::string& path, const std::vector<T>& testValues,
                  const std::string& description, const std::string& testType) {
-        std::cout << COLOR_CYAN << "\n  → Testing Sensor: " << COLOR_RESET << path << " (" << description << ")\n";
+        std::cout << COLOR_CYAN << "\n  → Testing: " << COLOR_RESET << path << " (" << description << ")\n";
 
         bool signalAvailable = false;
 
@@ -145,75 +137,6 @@ public:
                          "MISMATCH - Write: " + valueStr + ", Read: " + readStr, totalDuration);
                 std::cout << COLOR_RED << "    ✗ " << COLOR_RESET
                          << "MISMATCH - Wrote " << valueStr << " but read " << readStr << "\n";
-            }
-        }
-    }
-
-    // Test actuators using TARGET value API
-    template<typename T>
-    void testE2EActuator(const std::string& path, const std::vector<T>& testValues,
-                         const std::string& description, const std::string& testType) {
-        std::cout << COLOR_CYAN << "\n  → Testing Actuator: " << COLOR_RESET << path << " (" << description << ")\n";
-
-        bool signalAvailable = false;
-
-        for (size_t i = 0; i < testValues.size(); i++) {
-            T testValue = testValues[i];
-
-            // Step 1: Write TARGET value
-            auto writeStart = std::chrono::high_resolution_clock::now();
-            client.setTargetValue(path, testValue);
-            auto writeEnd = std::chrono::high_resolution_clock::now();
-            double writeDuration = std::chrono::duration<double, std::milli>(writeEnd - writeStart).count();
-
-            // Step 2: Wait for value to propagate
-            std::this_thread::sleep_for(50ms);
-
-            // Step 3: Read back TARGET value to verify
-            auto readStart = std::chrono::high_resolution_clock::now();
-            T readValue{};
-            bool readSuccess = client.getTargetValue(path, readValue);
-            auto readEnd = std::chrono::high_resolution_clock::now();
-            double readDuration = std::chrono::duration<double, std::milli>(readEnd - readStart).count();
-
-            double totalDuration = writeDuration + readDuration;
-
-            if (!readSuccess) {
-                // Signal doesn't exist or we're not connected
-                if (i == 0) {  // Only report once per signal
-                    addResult(testType + "_ACTUATOR", path, false,
-                             "SIGNAL NOT AVAILABLE - Cannot read target after write", totalDuration);
-                    std::cout << COLOR_YELLOW << "    ⊗ " << COLOR_RESET
-                             << "Signal not available\n";
-                }
-                break;  // Skip remaining test values for this signal
-            }
-
-            signalAvailable = true;
-
-            // Verify the value matches
-            bool match = false;
-            if constexpr (std::is_floating_point_v<T>) {
-                match = std::abs(readValue - testValue) < 0.01;
-            } else {
-                match = (readValue == testValue);
-            }
-
-            if (match) {
-                std::string valueStr = formatValue(testValue);
-                std::string readStr = formatValue(readValue);
-                addResult(testType + "_ACTUATOR", path, true,
-                         "WriteTarget: " + valueStr + ", ReadTarget: " + readStr + " ✓", totalDuration);
-                std::cout << COLOR_GREEN << "    ✓ " << COLOR_RESET
-                         << "WriteTarget " << valueStr << " → ReadTarget " << readStr
-                         << " (" << formatDuration(totalDuration) << ")\n";
-            } else {
-                std::string valueStr = formatValue(testValue);
-                std::string readStr = formatValue(readValue);
-                addResult(testType + "_ACTUATOR", path, false,
-                         "MISMATCH - WriteTarget: " + valueStr + ", ReadTarget: " + readStr, totalDuration);
-                std::cout << COLOR_RED << "    ✗ " << COLOR_RESET
-                         << "MISMATCH - Wrote target " << valueStr << " but read " << readStr << "\n";
             }
         }
     }
@@ -338,47 +261,6 @@ public:
         }
     }
 
-    void stressTestConcurrentWritesActuator(const std::string& path, float baseValue, int iterations = 100) {
-        std::cout << COLOR_CYAN << "\n  → Stress test (Actuator): " << iterations
-                 << " concurrent target value writes to " << path << COLOR_RESET << "\n";
-
-        auto start = std::chrono::high_resolution_clock::now();
-        int verifiedCount = 0;
-
-        for (int i = 0; i < iterations; i++) {
-            float value = baseValue + (i % 10) * 0.1f;
-            client.setTargetValue(path, value);
-
-            // Periodically verify (every 10 writes)
-            if (i % 10 == 0) {
-                std::this_thread::sleep_for(10ms);
-                float readValue;
-                if (client.getTargetValue(path, readValue)) {
-                    verifiedCount++;
-                }
-            }
-        }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        double duration = std::chrono::duration<double, std::milli>(end - start).count();
-        double avgLatency = duration / iterations;
-
-        if (verifiedCount > 0) {
-            addResult("STRESS_WRITE_ACTUATOR", path, true,
-                     std::to_string(iterations) + " target writes completed, " +
-                     std::to_string(verifiedCount) + " verified, avg " + formatDuration(avgLatency), duration);
-            std::cout << COLOR_GREEN << "    ✓ " << COLOR_RESET
-                     << iterations << " target writes completed, " << verifiedCount << " verified"
-                     << " (avg: " << formatDuration(avgLatency) << "/write, total: "
-                     << formatDuration(duration) << ")\n";
-        } else {
-            addResult("STRESS_WRITE_ACTUATOR", path, false,
-                     "Signal not available for verification", duration);
-            std::cout << COLOR_YELLOW << "    ⊗ " << COLOR_RESET
-                     << "Could not verify target writes (signal not available)\n";
-        }
-    }
-
     void stressTestConcurrentReads(const std::string& path, int iterations = 100) {
         std::cout << COLOR_CYAN << "\n  → Stress test: " << iterations
                  << " concurrent reads from " << path << COLOR_RESET << "\n";
@@ -499,17 +381,10 @@ public:
 int main(int argc, char* argv[]) {
     std::cout << COLOR_BOLD << "\n╔════════════════════════════════════════╗\n";
     std::cout << "║  VSS Signal End-to-End Test Suite     ║\n";
-    std::cout << "║  (KUKSA Databroker Client Library)    ║\n";
     std::cout << "╚════════════════════════════════════════╝\n" << COLOR_RESET << "\n";
 
-    // Setup Kuksa client - use custom URI if provided, otherwise default
+    // Setup Kuksa client
     std::string serverURI = (argc > 1) ? argv[1] : "127.0.0.1:55555";
-
-    std::cout << "Test Configuration:\n";
-    std::cout << "  Databroker URI: " << serverURI << "\n";
-    std::cout << "  Test Signals:   11 (8 sensors + 3 actuators)\n";
-    std::cout << "  Test Values:    ~60 individual write-read cycles\n";
-    std::cout << "  Stress Tests:   200 operations (100 reads + 100 writes)\n\n";
 
     KuksaClient::Config clientConfig;
     clientConfig.serverURI = serverURI;
@@ -524,8 +399,7 @@ int main(int argc, char* argv[]) {
     } catch (const std::exception& e) {
         std::cerr << COLOR_RED << "Failed to connect to databroker!" << COLOR_RESET << "\n";
         std::cerr << "Error: " << e.what() << "\n";
-        std::cerr << "\nMake sure KUKSA Databroker is running at " << clientConfig.serverURI << "\n";
-        std::cerr << "Example: docker run -it --rm -p 55555:55555 ghcr.io/eclipse/kuksa.val/databroker:master\n\n";
+        std::cerr << "Make sure KUKSA Databroker is running at " << clientConfig.serverURI << "\n";
         return 1;
     }
 
@@ -538,7 +412,7 @@ int main(int argc, char* argv[]) {
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << COLOR_RESET << "\n";
 
     tester.testE2E<float>("Vehicle.Speed",
-                          {0.0f, 60.5f, 120.0f, 80.5f, 50.0f},
+                          {0.0f, 60.5f, 120.0f, 80.5f, 0.0f},
                           "Vehicle speed (km/h)", "FLOAT");
 
     tester.testE2E<uint32_t>("Vehicle.Powertrain.FuelSystem.Range",
@@ -550,7 +424,7 @@ int main(int argc, char* argv[]) {
                            "Current gear", "INT8");
 
     tester.testE2E<uint16_t>("Vehicle.Powertrain.CombustionEngine.Speed",
-                             {800, 1500, 3000, 4500, 6000, 1200},
+                             {800, 1500, 3000, 4500, 6000, 800},
                              "Engine RPM", "UINT16");
 
     tester.testE2E<uint16_t>("Vehicle.Powertrain.CombustionEngine.Power",
@@ -575,17 +449,17 @@ int main(int argc, char* argv[]) {
     std::cout << "  Write → Read → Verify\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << COLOR_RESET << "\n";
 
-    tester.testE2EActuator<std::string>("Vehicle.Body.DriveMode",
-                                        {"ECO", "NORMAL", "SPORT", "U_SPORTINESS", "NORMAL"},
-                                        "Drive mode", "STRING");
+    tester.testE2E<std::string>("Vehicle.Body.DriveMode",
+                                {"ECO", "NORMAL", "SPORT", "U_SPORTINESS", "NORMAL"},
+                                "Drive mode", "STRING");
 
-    tester.testE2EActuator<float>("Vehicle.Chassis.Sportiness.Target",
-                                  {0.0f, 25.0f, 50.0f, 75.0f, 100.0f, 50.0f},
-                                  "Sportiness target (%)", "FLOAT");
+    tester.testE2E<float>("Vehicle.Chassis.Sportiness.Target",
+                          {0.0f, 25.0f, 50.0f, 75.0f, 100.0f, 50.0f},
+                          "Sportiness target (%)", "FLOAT");
 
-    tester.testE2EActuator<uint8_t>("Vehicle.Chassis.Sportiness.Mode",
-                                    {0, 2, 5, 8, 10, 5},
-                                    "Sportiness mode level", "UINT8");
+    tester.testE2E<uint8_t>("Vehicle.Chassis.Sportiness.Mode",
+                            {0, 2, 5, 8, 10, 5},
+                            "Sportiness mode level", "UINT8");
 
     // ==================== SUBSCRIPTION TESTS ====================
     std::cout << "\n" << COLOR_BOLD << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
@@ -601,16 +475,13 @@ int main(int argc, char* argv[]) {
     std::cout << "  STRESS TESTS\n";
     std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << COLOR_RESET << "\n";
 
-    tester.stressTestConcurrentWritesActuator("Vehicle.Chassis.Sportiness.Target", 50.0f, 100);
+    tester.stressTestConcurrentWrites("Vehicle.Chassis.Sportiness.Target", 50.0f, 100);
     tester.stressTestConcurrentReads("Vehicle.Speed", 100);
 
     // ==================== FINAL REPORT ====================
     tester.printSummary();
-    tester.saveReport("/tmp/test_results.txt");
+    tester.saveReport("test_results.txt");
 
     std::cout << COLOR_GREEN << "\n✓ All tests completed!\n" << COLOR_RESET;
-    std::cout << "\nTest report saved to: /tmp/test_results.txt\n";
-    std::cout << "View inside container: cat /tmp/test_results.txt\n\n";
-
     return 0;
 }

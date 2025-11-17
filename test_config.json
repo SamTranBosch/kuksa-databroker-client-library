@@ -1,0 +1,107 @@
+{
+  "broker": {
+    "serverURI": "127.0.0.1:55555"
+  },
+  "debug": true,
+  "test_signals": {
+    "sensors": [
+      {
+        "path": "Vehicle.Speed",
+        "type": "float",
+        "unit": "km/h",
+        "test_values": [0.0, 60.5, 120.0, 200.5],
+        "description": "Vehicle speed"
+      },
+      {
+        "path": "Vehicle.Powertrain.FuelSystem.Range",
+        "type": "uint32",
+        "unit": "km",
+        "test_values": [0, 100, 500, 1000],
+        "description": "Remaining fuel range"
+      },
+      {
+        "path": "Vehicle.Powertrain.Transmission.CurrentGear",
+        "type": "int8",
+        "unit": "gear",
+        "test_values": [-1, 0, 1, 3, 5, 6],
+        "description": "Current transmission gear (-1=reverse, 0=neutral)"
+      },
+      {
+        "path": "Vehicle.Powertrain.CombustionEngine.Speed",
+        "type": "uint16",
+        "unit": "rpm",
+        "test_values": [0, 800, 3000, 6500],
+        "description": "Engine RPM"
+      },
+      {
+        "path": "Vehicle.Powertrain.CombustionEngine.Power",
+        "type": "uint16",
+        "unit": "kW",
+        "test_values": [0, 50, 150, 300],
+        "description": "Engine power output"
+      },
+      {
+        "path": "Vehicle.Powertrain.IsIgnitionOn",
+        "type": "bool",
+        "unit": "boolean",
+        "test_values": [true, false],
+        "description": "Ignition status"
+      },
+      {
+        "path": "Vehicle.Chassis.Accelerator.PedalPosition",
+        "type": "float",
+        "unit": "%",
+        "test_values": [0.0, 25.5, 50.0, 75.3, 100.0],
+        "description": "Accelerator pedal position"
+      },
+      {
+        "path": "Vehicle.Chassis.Brake.PedalPosition",
+        "type": "float",
+        "unit": "%",
+        "test_values": [0.0, 30.0, 60.5, 100.0],
+        "description": "Brake pedal position"
+      }
+    ],
+    "actuators": [
+      {
+        "path": "Vehicle.Body.DriveMode",
+        "type": "string",
+        "unit": "mode",
+        "test_values": ["ECO", "NORMAL", "SPORT", "U_SPORTINESS"],
+        "valid_values": ["ECO", "NORMAL", "SPORT", "U_SPORTINESS"],
+        "description": "Drive mode selection"
+      },
+      {
+        "path": "Vehicle.Chassis.Sportiness.Target",
+        "type": "float",
+        "unit": "%",
+        "test_values": [0.0, 25.0, 50.0, 75.0, 100.0],
+        "min": 0.0,
+        "max": 100.0,
+        "description": "Target sportiness level"
+      },
+      {
+        "path": "Vehicle.Chassis.Sportiness.Mode",
+        "type": "uint8",
+        "unit": "level",
+        "test_values": [0, 2, 5, 8, 10],
+        "min": 0,
+        "max": 10,
+        "description": "Sportiness mode level"
+      }
+    ]
+  },
+  "test_scenarios": {
+    "stress_test": {
+      "iterations": 100,
+      "concurrent_subscriptions": 50
+    },
+    "boundary_test": {
+      "enabled": true
+    },
+    "subscription_test": {
+      "duration_seconds": 10,
+      "update_interval_ms": 100
+    }
+  }
+}

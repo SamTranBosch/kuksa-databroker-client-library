@@ -1,0 +1,40 @@
+╔═══════════════════════════════════════════════════════════════╗
+║   KUBERNETES E2E TESTING - QUICK START GUIDE                 ║
+║   (for databroker inside sdv-runtime pod)                    ║
+╚═══════════════════════════════════════════════════════════════╝
+
+🎯 YOUR SETUP: kuksa-databroker is in sdv-runtime pod
+
+📋 QUICK STEPS:
+
+1️⃣  Find your pod:
+    kubectl get pods | grep sdv-runtime
+
+2️⃣  Setup port forwarding (Terminal 1):
+    kubectl port-forward pod/<sdv-runtime-pod> 55555:55555
+
+3️⃣  Run C++ test (Terminal 2):
+    docker run --rm --network host \
+      kuksa-databroker-client:amd64 \
+      /usr/local/bin/KuksaDatabrokerClient 127.0.0.1:55555
+
+4️⃣  Verify with CLI (Terminal 3):
+    docker run -it --rm --network host \
+      ghcr.io/eclipse/kuksa.val/databroker:master \
+      kuksa-client --server 127.0.0.1:55555
+
+    # In CLI:
+    getValue Vehicle.Speed
+
+✅ SUCCESS if:
+   - C++ test shows "All tests completed!"
+   - CLI can read values written by C++ (e.g., Vehicle.Speed)
+   - Both can communicate bidirectionally
+
+📖 Detailed Guide: KUBERNETES_E2E_TEST.md
+
+🔧 Debug:
+    kubectl logs <sdv-runtime-pod>
+    kubectl exec <sdv-runtime-pod> -- ps aux | grep databroker
+    
+═══════════════════════════════════════════════════════════════
